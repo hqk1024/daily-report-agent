@@ -10,7 +10,7 @@ from servers.mcp_base import Server
 
 async def search_news(query: str, days: int = 7) -> str:
     """Search for mining-related news articles."""
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 
     results = []
     with DDGS() as ddgs:
