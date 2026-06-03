@@ -107,27 +107,101 @@ class Server:
         }
 
     async def run(self):
-        """Read JSON-RPC requests from stdin, write responses to stdout."""
+        """Read JSON-RPC requests from stdin, write responses to stdout.
+        Auto-detects Content-Length framing vs newline-delimited JSON
+        on the first message, so the server works with both Cursor's
+        standard MCP stdio transport and our agent's framed transport."""
+        framed_mode: bool | None = None
+
         while True:
-            line = sys.stdin.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
+            if framed_mode is None:
+                msg = _detect_and_read(sys.stdin.buffer)
+                if msg is None:
+                    break
+                framed_mode = msg.pop("__framed_mode__", False)
+            elif framed_mode:
+                msg = _read_message(sys.stdin.buffer)
+                if msg is None:
+                    break
+            else:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    break
+                line_str = line.decode("utf-8").strip()
+                if not line_str:
+                    continue
+                msg = json.loads(line_str)
+
             try:
-                msg = json.loads(line)
                 response = await self._handle_request(msg)
                 if response is not None:
-                    sys.stdout.write(json.dumps(response) + "\n")
-                    sys.stdout.flush()
-            except json.JSONDecodeError:
-                sys.stdout.write(
-                    json.dumps({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}) + "\n"
-                )
-                sys.stdout.flush()
+                    if framed_mode:
+                        _write_message(sys.stdout.buffer, response)
+                    else:
+                        _write_line(sys.stdout, response)
             except Exception:
-                sys.stdout.write(
-                    json.dumps({"jsonrpc": "2.0", "error": {"code": -32000, "message": traceback.format_exc()}}) + "\n"
-                )
-                sys.stdout.flush()
+                error_resp = {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32000, "message": traceback.format_exc()},
+                }
+                if framed_mode:
+                    _write_message(sys.stdout.buffer, error_resp)
+                else:
+                    _write_line(sys.stdout, error_resp)
+
+
+def _read_message(buffer) -> dict | None:
+    """Read one Content-Length framed JSON message from a binary buffer.
+    Returns None on EOF."""
+    header = buffer.readline()
+    if not header:
+        return None
+    header = header.decode("ascii").strip()
+    if not header:
+        return None
+    if not header.startswith("Content-Length:"):
+        raise ValueError(f"Expected Content-Length header, got: {header}")
+    content_length = int(header.split(":", 1)[1].strip())
+    buffer.readline()  # consume blank separator line
+    body = buffer.read(content_length)
+    return json.loads(body.decode("utf-8"))
+
+
+def _write_message(buffer, data: dict) -> None:
+    """Write one JSON message with Content-Length framing to a binary buffer."""
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+    buffer.write(header + body)
+    buffer.flush()
+
+
+def _write_line(buffer, data: dict) -> None:
+    """Write one JSON message as a single newline-delimited line."""
+    body = json.dumps(data, ensure_ascii=False) + "\n"
+    buffer.write(body)
+    buffer.flush()
+
+
+def _detect_and_read(buffer) -> dict | None:
+    """Read the first message and detect framing mode.
+    Returns a dict with __framed_mode__ key indicating the detected mode.
+    Returns None on EOF."""
+    first_line = buffer.readline()
+    if not first_line:
+        return None
+    first_line_str = first_line.decode("ascii").strip()
+
+    if first_line_str.startswith("Content-Length:"):
+        content_length = int(first_line_str.split(":", 1)[1].strip())
+        buffer.readline()  # consume blank separator line
+        body = buffer.read(content_length)
+        msg = json.loads(body.decode("utf-8"))
+        msg["__framed_mode__"] = True
+        return msg
+
+    # Newline-delimited mode: the first line IS the message
+    if not first_line_str:
+        return None
+    msg = json.loads(first_line_str)
+    msg["__framed_mode__"] = False
+    return msg

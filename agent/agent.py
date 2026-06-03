@@ -13,8 +13,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 logger = logging.getLogger(__name__)
 
 
@@ -66,20 +64,32 @@ class MCPClient:
             if text:
                 logger.error("[%s stderr] %s", self.server_name, text)
 
+    def _write_frame(self, data: dict) -> None:
+        """Write a Content-Length framed JSON message."""
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        self._writer.write(header + body)
+
+    async def _read_frame(self) -> dict:
+        """Read a Content-Length framed JSON message."""
+        header = await self._reader.readuntil(b"\r\n\r\n")
+        header_str = header.decode("ascii").strip()
+        if not header_str.startswith("Content-Length:"):
+            raise ConnectionError(f"Expected Content-Length header, got: {header_str}")
+        content_length = int(header_str.split(":", 1)[1].strip())
+        body = await self._reader.readexactly(content_length)
+        return json.loads(body.decode("utf-8"))
+
     async def _send_request(self, method: str, params: dict) -> dict:
         async with self._lock:
             self._req_id += 1
-            msg = json.dumps({
+            self._write_frame({
                 "jsonrpc": "2.0", "id": self._req_id,
                 "method": method, "params": params,
             })
-            self._writer.write((msg + "\n").encode())
             await self._writer.drain()
 
-            line = await self._reader.readline()
-            if not line:
-                raise ConnectionError(f"{self.server_name}: connection closed")
-            resp = json.loads(line.decode())
+            resp = await self._read_frame()
             if "error" in resp:
                 raise Exception(f"{self.server_name} error: {resp['error']}")
             return resp.get("result", {})
@@ -95,8 +105,7 @@ class MCPClient:
         return result.get("content", [])
 
     async def _send_notification(self, method: str, params: dict):
-        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params})
-        self._writer.write((msg + "\n").encode())
+        self._write_frame({"jsonrpc": "2.0", "method": method, "params": params})
         await self._writer.drain()
 
     async def stop(self):
@@ -276,37 +285,42 @@ class ResearchAgent:
 
     async def _find_and_extract_pdf(self, company: str, report: dict):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"https://html.duckduckgo.com/html/?q={company}+NI+43-101+resource+filetype:pdf",
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-            if resp.status_code == 200:
-                import re
-                pdf_urls = re.findall(r'href="(https?://[^"]+\.pdf)"', resp.text)
-                pdf_urls = [u for u in pdf_urls if any(
-                    kw in u.lower() for kw in ["resource", "43-101", company.lower().split()[-1]]
-                )]
-                if pdf_urls:
-                    result = await self.pdf_client.call_tool(
-                        "extract_resources", {"pdf_url": pdf_urls[0]}
-                    )
-                    pdf_data = {}
-                    if isinstance(result, list):
-                        for item in result:
-                            if isinstance(item, dict) and "text" in item:
-                                try:
-                                    pdf_data = json.loads(item["text"])
-                                except json.JSONDecodeError:
-                                    pass
-                    report["sections"]["resources"] = {
-                        "title": f"Mineral Resource Estimates ({company})",
-                        "content": pdf_data,
-                    }
-                    report["sources"].append({
-                        "type": "pdf", "url": pdf_urls[0],
-                        "description": f"NI 43-101 Resource Report for {company}",
-                    })
+            from ddgs import DDGS
+
+            pdf_urls = []
+            query = f"{company} NI 43-101 resource filetype:pdf"
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=10):
+                    url = r.get("href", "")
+                    if url.endswith(".pdf"):
+                        pdf_urls.append(url)
+
+            if not pdf_urls:
+                report["sections"]["resources"] = {
+                    "title": f"Mineral Resource Estimates ({company})",
+                    "note": f"No NI 43-101 resource PDF found for {company} via web search.",
+                }
+                return
+
+            result = await self.pdf_client.call_tool(
+                "extract_resources", {"pdf_url": pdf_urls[0]}
+            )
+            pdf_data = {}
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, dict) and "text" in item:
+                        try:
+                            pdf_data = json.loads(item["text"])
+                        except json.JSONDecodeError:
+                            pass
+            report["sections"]["resources"] = {
+                "title": f"Mineral Resource Estimates ({company})",
+                "content": pdf_data,
+            }
+            report["sources"].append({
+                "type": "pdf", "url": pdf_urls[0],
+                "description": f"NI 43-101 Resource Report for {company}",
+            })
         except Exception as e:
             logger.error("PDF extraction failed: %s\n%s", e, traceback.format_exc())
             report["sections"]["resources"] = {

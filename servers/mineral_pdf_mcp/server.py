@@ -43,7 +43,16 @@ async def extract_resources(pdf_url: str) -> str:
                         "context": " | ".join(c.strip() for c in context if c.strip()),
                     })
 
-        extracted["text_content"] = full_text[:10000]
+        seen = set()
+        unique_estimates = []
+        for est in extracted["resource_estimates"]:
+            key = est["context"]
+            if key not in seen:
+                seen.add(key)
+                unique_estimates.append(est)
+        extracted["resource_estimates"] = unique_estimates[:50]
+
+        extracted["text_content"] = full_text[:2000]
         extracted["tables_found"] = len(extracted["resource_estimates"]) > 0
         doc.close()
         return json.dumps(extracted, ensure_ascii=False, indent=2)
