@@ -458,10 +458,13 @@ def main():
         async def health():
             return {"status": "ok"}
 
+        class ReportRequest(BaseModel):
+            query: str
+
         @app.post("/report")
-        async def generate(req: dict):
+        async def generate(req: ReportRequest):
             try:
-                report = await agent.generate_report(req.get("query", ""))
+                report = await agent.generate_report(req.query)
                 return {"success": True, "report": report}
             except Exception as e:
                 return {"success": False, "error": str(e)}
