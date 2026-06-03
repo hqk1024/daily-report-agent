@@ -1,0 +1,30 @@
+services:
+  agent-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: daily-report-agent
+    ports:
+      - "8000:8000"
+    command: python agent/agent.py --api --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    networks:
+      - report-net
+
+  frontend:
+    image: node:20-alpine
+    container_name: daily-report-frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - agent-api
+    networks:
+      - report-net
+
+networks:
+  report-net:
+    driver: bridge

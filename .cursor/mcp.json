@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "mining-news-mcp": {
+      "command": "D:\\connda\\python.exe",
+      "args": ["-m", "servers.mining_news_mcp"],
+      "cwd": "C:\\Users\\111\\Desktop\\py\\daily-report-agent"
+    },
+    "mineral-pdf-mcp": {
+      "command": "D:\\connda\\python.exe",
+      "args": ["-m", "servers.mineral_pdf_mcp"],
+      "cwd": "C:\\Users\\111\\Desktop\\py\\daily-report-agent"
+    },
+    "lme-price-mcp": {
+      "command": "D:\\connda\\python.exe",
+      "args": ["-m", "servers.lme_price_mcp"],
+      "cwd": "C:\\Users\\111\\Desktop\\py\\daily-report-agent"
+    }
+  }
+}
