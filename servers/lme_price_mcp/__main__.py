@@ -1,4 +1,4 @@
 import asyncio
-from . import server
+from servers.lme_price_mcp.server import server
 
-asyncio.run(server.server.run())
+asyncio.run(server.run())

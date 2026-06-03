@@ -5,13 +5,17 @@ Orchestrates 3 MCP servers to produce comprehensive research reports.
 
 import asyncio
 import json
+import logging
 import subprocess
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 # ── MCP Client ──────────────────────────────────────────────────────────────
@@ -27,6 +31,7 @@ class MCPClient:
         self._req_id = 0
         self._reader = None
         self._writer = None
+        self._lock = asyncio.Lock()
 
     async def start(self):
         """Spawn the server subprocess and establish stdio transport."""
@@ -37,11 +42,11 @@ class MCPClient:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # On all platforms (including Windows ProactorEventLoop),
-        # create_subprocess_exec already returns StreamReader/StreamWriter
-        # via .stdout and .stdin respectively.
         self._reader = self._process.stdout
         self._writer = self._process.stdin
+
+        # Read stderr in background so server crashes are visible
+        asyncio.create_task(self._log_stderr())
 
         # Initialize session
         await self._send_request("initialize", {
@@ -51,22 +56,33 @@ class MCPClient:
         })
         await self._send_notification("notifications/initialized", {})
 
-    async def _send_request(self, method: str, params: dict) -> dict:
-        self._req_id += 1
-        msg = json.dumps({
-            "jsonrpc": "2.0", "id": self._req_id,
-            "method": method, "params": params,
-        })
-        self._writer.write((msg + "\n").encode())
-        await self._writer.drain()
+    async def _log_stderr(self):
+        """Read and log stderr from the subprocess."""
+        while True:
+            line = await self._process.stderr.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            if text:
+                logger.error("[%s stderr] %s", self.server_name, text)
 
-        line = await self._reader.readline()
-        if not line:
-            raise ConnectionError(f"{self.server_name}: connection closed")
-        resp = json.loads(line.decode())
-        if "error" in resp:
-            raise Exception(f"{self.server_name} error: {resp['error']}")
-        return resp.get("result", {})
+    async def _send_request(self, method: str, params: dict) -> dict:
+        async with self._lock:
+            self._req_id += 1
+            msg = json.dumps({
+                "jsonrpc": "2.0", "id": self._req_id,
+                "method": method, "params": params,
+            })
+            self._writer.write((msg + "\n").encode())
+            await self._writer.drain()
+
+            line = await self._reader.readline()
+            if not line:
+                raise ConnectionError(f"{self.server_name}: connection closed")
+            resp = json.loads(line.decode())
+            if "error" in resp:
+                raise Exception(f"{self.server_name} error: {resp['error']}")
+            return resp.get("result", {})
 
     async def list_tools(self) -> list[dict]:
         result = await self._send_request("tools/list", {})
@@ -146,7 +162,7 @@ class ResearchAgent:
         if tasks:
             await asyncio.gather(*tasks)
 
-        if self.pdf_client and report["sources"]:
+        if self.pdf_client:
             await self._find_and_extract_pdf(company, report)
 
         report["markdown"] = self._compile_markdown(report)
@@ -181,11 +197,9 @@ class ResearchAgent:
 
     async def _search_news(self, company: str, commodity: str, report: dict):
         try:
-            result1 = await self.news_client.call_tool(
-                "search_news", {"query": company, "days": 30}
-            )
-            result2 = await self.news_client.call_tool(
-                "search_news", {"query": f"{commodity} {company}", "days": 30}
+            result1, result2 = await asyncio.gather(
+                self.news_client.call_tool("search_news", {"query": company, "days": 30}),
+                self.news_client.call_tool("search_news", {"query": f"{commodity} {company}", "days": 30}),
             )
 
             articles = []
@@ -227,6 +241,7 @@ class ResearchAgent:
                     except Exception:
                         pass
         except Exception as e:
+            logger.error("News search failed: %s\n%s", e, traceback.format_exc())
             report["sections"]["news"] = {"title": "News Search", "error": str(e)}
 
     async def _get_price(self, commodity: str, report: dict):
@@ -254,6 +269,7 @@ class ResearchAgent:
                 "source": price_data.get("source", "market data"),
             })
         except Exception as e:
+            logger.error("Price fetch failed: %s\n%s", e, traceback.format_exc())
             report["sections"]["price"] = {
                 "title": f"{commodity.title()} Price Analysis", "error": str(e),
             }
@@ -292,6 +308,7 @@ class ResearchAgent:
                         "description": f"NI 43-101 Resource Report for {company}",
                     })
         except Exception as e:
+            logger.error("PDF extraction failed: %s\n%s", e, traceback.format_exc())
             report["sections"]["resources"] = {
                 "title": f"Mineral Resource Estimates ({company})",
                 "note": f"PDF extraction unavailable: {e}",
@@ -314,13 +331,36 @@ class ResearchAgent:
         rs = report["sections"].get("resources", {})
 
         nc = len(ns.get("content", []))
-        pv = ps.get("price_data", {}).get("price", "N/A") if "price_data" in ps else "N/A"
-        rn = "Available" if "content" in rs else "Not available"
+        ns_error = ns.get("error", "")
+        if ns_error:
+            nc = f"Error: {ns_error}"
+
+        pd_summary = ps.get("price_data", {})
+        ps_error = ps.get("error", "")
+        if ps_error:
+            pv = f"Error: {ps_error}"
+            pv_unit = ""
+            pv_currency = ""
+        else:
+            pv = pd_summary.get("spot_price") or pd_summary.get("price") or "N/A"
+            pv_unit = pd_summary.get("unit", "")
+            pv_currency = pd_summary.get("currency", "")
+
+        rs_error = rs.get("error", "")
+        if rs_error:
+            rn = f"Error: {rs_error}"
+        elif "content" in rs:
+            rn = "Available"
+        elif "note" in rs:
+            rn = rs["note"]
+        else:
+            rn = "Not available"
 
         lines.append(f"- **Company:** {company}")
         lines.append(f"- **Commodity:** {commodity}")
         lines.append(f"- **Recent News Articles Found:** {nc}")
-        lines.append(f"- **Current {commodity} Price:** {pv}")
+        lines.append(f"- **Current {commodity} Price:** {pv} {pv_unit} ({pv_currency})")
+        lines.append(f"- **Data Source:** {pd_summary.get('source', 'N/A')}")
         lines.append(f"- **Mineral Resource Data:** {rn}")
         lines.append("")
 
@@ -338,6 +378,8 @@ class ResearchAgent:
                 if snippet:
                     lines.append(f"{snippet}")
                 lines.append("")
+        elif "error" in ns:
+            lines.append(f"**Error:** {ns['error']}\n")
         else:
             lines.append("No news data available.\n")
 
@@ -345,15 +387,28 @@ class ResearchAgent:
         lines.append("")
         if "price_data" in ps:
             pd = ps["price_data"]
+            unit = pd.get("unit", "")
             lines.append(f"| Metric | Value |")
             lines.append(f"|--------|-------|")
-            lines.append(f"| Current Price | {pd.get('price', 'N/A')} |")
-            lines.append(f"| Change | {pd.get('change', 'N/A')} |")
+            if pd.get("spot_price"):
+                lines.append(f"| Spot Price | {pd['spot_price']} {unit} |")
+            else:
+                lines.append(f"| Current Price | {pd.get('price', 'N/A')} |")
+            if pd.get("dominant_contract"):
+                lines.append(f"| Dominant Contract | {pd['dominant_contract']} → {pd.get('dominant_contract_price', 'N/A')} {unit} |")
+            if pd.get("near_contract"):
+                lines.append(f"| Near Contract | {pd['near_contract']} → {pd.get('near_contract_price', 'N/A')} {unit} |")
+            if pd.get("change_pct") is not None:
+                lines.append(f"| Change | {pd['change_pct']:.2f}% |")
+            elif pd.get("change") is not None:
+                lines.append(f"| Change | {pd.get('change')} |")
             lines.append(f"| Source | {pd.get('source', 'N/A')} |")
             lines.append("")
+        elif "error" in ps:
+            lines.append(f"**Error:** {ps['error']}\n")
         if "trend_data" in ps:
             td = ps["trend_data"]
-            lines.append(f"**Trend:** {td.get('analysis', 'N/A')}")
+            lines.append(f"**Trend:** {td.get('analysis', td.get('note', 'N/A'))}")
             lines.append("")
             lines.append(f"**Recommendation:** {td.get('recommendation', 'Monitor closely')}")
             lines.append("")
@@ -370,6 +425,8 @@ class ResearchAgent:
             else:
                 lines.append("Resource data extracted (see full report).")
             lines.append("")
+        elif "error" in rs:
+            lines.append(f"**Error:** {rs['error']}\n")
         elif "note" in rs:
             lines.append(rs["note"] + "\n")
         else:

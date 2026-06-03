@@ -1,4 +1,4 @@
 import asyncio
-from . import server
+from servers.mineral_pdf_mcp.server import server
 
-asyncio.run(server.server.run())
+asyncio.run(server.run())
